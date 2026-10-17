@@ -3,12 +3,6 @@ name: Build ImmortalWrt for Hisense HNR101
 
 on:
   workflow_dispatch:
-    inputs:
-      clean_build:
-        description: "Clean build (disable compilation cache)"
-        required: true
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -19,7 +13,7 @@ concurrency:
 
 jobs:
   build:
-    name: HNR101 Firmware
+    name: HNR101 Chinese LuCI + iStore + OpenClash
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -48,22 +42,17 @@ jobs:
             patch pkgconf qemu-utils squashfs-tools \
             subversion swig time xsltproc zstd
 
-      - name: Clone HNR101-capable ImmortalWrt source
+      - name: Clone HNR101 source
         run: |
-          git clone --depth 1 \
-            https://github.com/sqliuchang/immortalwrt.git \
-            immortalwrt
-
+          git clone "$REPO_URL" immortalwrt
           cd immortalwrt
 
-          # Fetch and pin the exact HNR101 support commit.
-          git fetch --depth 1 origin "$REPO_COMMIT"
+          git fetch origin "$REPO_COMMIT"
           git checkout --detach "$REPO_COMMIT"
 
-          echo "Source commit:"
           git log -1 --oneline
 
-      - name: Verify HNR101 device support
+      - name: Verify HNR101 device files
         run: |
           cd immortalwrt
 
@@ -71,16 +60,40 @@ jobs:
           test -f target/linux/qualcommax/image/ipq807x.mk
           test -f package/firmware/ipq-wifi/src/board-hisense_hnr101.ipq8074
 
-          grep -n -i -A 15 -B 3 'hisense_hnr101' \
-            target/linux/qualcommax/image/ipq807x.mk || true
+          echo "HNR101 device support verified."
 
-          echo "HNR101 device files found."
+      - name: Add iStore feed
+        run: |
+          cd immortalwrt
+
+          grep -q 'src-git istore ' feeds.conf.default || \
+            echo 'src-git istore https://github.com/linkease/istore;main' \
+            >> feeds.conf.default
+
+      - name: Fetch OpenClash source
+        run: |
+          cd immortalwrt
+
+          mkdir -p package/luci-app-openclash
+
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/vernesong/OpenClash.git \
+            package/luci-app-openclash
+
+          cd package/luci-app-openclash
+          git sparse-checkout set luci-app-openclash
+
+          test -f luci-app-openclash/Makefile
 
       - name: Update and install feeds
         run: |
           cd immortalwrt
+
           ./scripts/feeds update -a
           ./scripts/feeds install -a
+
+          ./scripts/feeds update istore
+          ./scripts/feeds install -d y -p istore luci-app-store
 
       - name: Generate HNR101 configuration
         run: |
@@ -91,17 +104,39 @@ jobs:
           CONFIG_TARGET_qualcommax_ipq807x=y
           CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y
 
+          # LuCI Chinese interface
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-ssl=y
+          CONFIG_PACKAGE_luci-compat=y
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_LUCI_LANG_zh_Hans=y
 
+          # iStore app store
+          CONFIG_PACKAGE_luci-app-store=y
+
+          # OpenClash LuCI application
+          CONFIG_PACKAGE_luci-app-openclash=y
+
+          # OpenClash common runtime dependencies
+          CONFIG_PACKAGE_bash=y
           CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_wget-ssl=y
           CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_ip-full=y
+          CONFIG_PACKAGE_ruby=y
+          CONFIG_PACKAGE_ruby-yaml=y
+          CONFIG_PACKAGE_dnsmasq-full=y
+          CONFIG_PACKAGE_unzip=y
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_kmod-inet-diag=y
+          CONFIG_PACKAGE_kmod-nft-tproxy=y
+
+          # Utilities
+          CONFIG_PACKAGE_wget-ssl=y
           CONFIG_PACKAGE_htop=y
           CONFIG_PACKAGE_tcpdump=y
           CONFIG_PACKAGE_ethtool=y
 
+          # USB storage support
           CONFIG_PACKAGE_kmod-usb3=y
           CONFIG_PACKAGE_kmod-usb-storage=y
           CONFIG_PACKAGE_block-mount=y
@@ -111,15 +146,26 @@ jobs:
 
           make defconfig
 
-          echo "Checking target configuration..."
-          grep -E '^CONFIG_TARGET_(qualcommax|DEVICE_qualcommax)' .config
+          grep -E \
+            'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101|CONFIG_PACKAGE_luci-app-store|CONFIG_PACKAGE_luci-app-openclash|CONFIG_PACKAGE_luci-i18n-base-zh-cn' \
+            .config || true
 
           grep -qx \
             'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y' \
             .config || {
-              echo "ERROR: HNR101 target profile is not enabled."
+              echo "ERROR: HNR101 target profile is missing."
               exit 1
             }
+
+          grep -qx 'CONFIG_PACKAGE_luci-app-store=y' .config || {
+            echo "ERROR: iStore package is not selected."
+            exit 1
+          }
+
+          grep -qx 'CONFIG_PACKAGE_luci-app-openclash=y' .config || {
+            echo "ERROR: OpenClash package is not selected."
+            exit 1
+          }
 
       - name: Download sources
         run: |
@@ -130,10 +176,6 @@ jobs:
       - name: Compile firmware
         run: |
           cd immortalwrt
-
-          echo "CPU threads: $(nproc)"
-          echo "Starting HNR101 build..."
-
           make -j2 V=s
         timeout-minutes: 300
 
@@ -142,46 +184,50 @@ jobs:
         run: |
           cd immortalwrt
 
-          echo "Generated image files:"
-          find bin/targets/qualcommax/ipq807x \
-            -maxdepth 2 -type f \
-            \( -name '*.bin' -o \
-               -name '*.ubi' -o \
-               -name '*.img' -o \
-               -name '*.itb' -o \
-               -name '*.tar' -o \
-               -name '*.manifest' -o \
-               -name '*.json' \) \
-            -print
+          TARGET="bin/targets/qualcommax/ipq807x"
 
-          test -n "$(find bin/targets/qualcommax/ipq807x \
-            -type f \( -name '*.bin' -o -name '*.ubi' \
-            -o -name '*.img' -o -name '*.itb' \) -print -quit)" || {
+          test -d "$TARGET"
+
+          find "$TARGET" -maxdepth 2 -type f -print
+
+          test -n "$(find "$TARGET" -type f \
+            \( -name '*.bin' -o -name '*.ubi' \
+            -o -name '*.img' -o -name '*.itb' \) \
+            -print -quit)" || {
               echo "ERROR: No firmware image found."
               exit 1
             }
 
-      - name: Save build configuration
+          if [ -f "$TARGET"/*.manifest ]; then
+            grep -iE 'luci-app-store|luci-app-openclash|luci-i18n-base-zh-cn' \
+              "$TARGET"/*.manifest || true
+          fi
+
+      - name: Save build information
         if: always()
         run: |
           mkdir -p build-info
+
           if [ -f immortalwrt/.config ]; then
             cp immortalwrt/.config build-info/config.txt
           fi
+
+          git -C immortalwrt rev-parse HEAD \
+            > build-info/source-commit.txt 2>/dev/null || true
+
           if [ -d immortalwrt/bin/targets/qualcommax/ipq807x ]; then
             cp immortalwrt/bin/targets/qualcommax/ipq807x/*.manifest \
               build-info/ 2>/dev/null || true
+
             cp immortalwrt/bin/targets/qualcommax/ipq807x/sha256sums \
               build-info/ 2>/dev/null || true
           fi
-          git -C immortalwrt rev-parse HEAD \
-            > build-info/source-commit.txt 2>/dev/null || true
 
       - name: Upload HNR101 firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt-HNR101-${{ github.run_number }}
+          name: ImmortalWrt-HNR101-CN-iStore-OpenClash-${{ github.run_number }}
           path: |
             immortalwrt/bin/targets/qualcommax/ipq807x/
             build-info/
