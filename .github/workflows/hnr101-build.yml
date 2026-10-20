@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build HNR101 firmware
+    name: Build HNR101 Minimal Chinese Firmware
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -30,18 +30,11 @@ jobs:
       - name: Checkout workflow repository
         uses: actions/checkout@v4
 
-      - name: Free disk space
-        run: |
-          set -e
-          df -h
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
-          df -h
-
       - name: Install build dependencies
         run: |
-          set -e
+          set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get install -y \
             build-essential \
             clang \
             flex \
@@ -54,10 +47,9 @@ jobs:
             git \
             libncurses-dev \
             libssl-dev \
-            python3-dev \
+            python3 \
             python3-setuptools \
-            python3-pip \
-            python3-yaml \
+            python3-pyelftools \
             rsync \
             swig \
             unzip \
@@ -65,395 +57,177 @@ jobs:
             file \
             wget \
             curl \
-            jq \
-            time \
-            perl \
-            xsltproc \
             ca-certificates \
-            ccache
-
-          git --version
-          python3 --version
+            perl \
+            cpio \
+            ecj \
+            fastjar \
+            java-propose-classpath \
+            libelf-dev \
+            device-tree-compiler \
+            qemu-utils \
+            time
 
       - name: Clone pinned ImmortalWrt source
         run: |
           set -euo pipefail
-
           git clone "$REPO_URL" "$BUILD_DIR"
           cd "$BUILD_DIR"
-
           git checkout --detach "$REPO_COMMIT"
+          echo "Source commit:"
+          git rev-parse HEAD
 
-          echo "Repository: $(git remote get-url origin)"
-          echo "Commit: $(git rev-parse HEAD)"
-
-          test "$(git rev-parse HEAD)" = "$REPO_COMMIT"
-
-      - name: Verify HNR101 target
+      - name: Remove optional third-party feed entries
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
 
-          DTS="target/linux/qualcommax/dts/ipq8072-hnr101.dts"
-          IMAGE_MK="target/linux/qualcommax/image/ipq807x.mk"
-
-          if [ ! -f "$DTS" ]; then
-            echo "::error::HNR101 DTS not found: $DTS"
-            find target/linux/qualcommax -iname '*hnr101*' -print || true
-            exit 1
+          # Do not add iStore or OpenClash feeds.
+          # Remove matching optional entries if they exist in this checkout.
+          if [ -f feeds.conf.default ]; then
+            sed -i '/istore/d;/openclash/d' feeds.conf.default
           fi
 
-          if [ ! -f "$IMAGE_MK" ]; then
-            echo "::error::IPQ807x image definition not found"
-            exit 1
-          fi
-
-          grep -RniE 'hisense.hnr101|hnr101' \
-            target/linux/qualcommax 2>/dev/null | head -100 || true
-
-      - name: Configure iStore feed
-        run: |
-          set -euo pipefail
-          cd "$BUILD_DIR"
-
-          if ! grep -qE '^[[:space:]]*src-git[[:space:]]+istore[[:space:]]' \
-            feeds.conf.default; then
-            echo 'src-git istore https://github.com/linkease/istore;main' \
-              >> feeds.conf.default
-          fi
-
-          grep -E '^[[:space:]]*src-git[[:space:]]+istore[[:space:]]' \
-            feeds.conf.default
+          echo "Configured feeds:"
+          cat feeds.conf.default
 
       - name: Update feeds
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
-
           ./scripts/feeds update -a
 
-          for feed in luci packages istore; do
-            if [ ! -d "feeds/$feed" ]; then
-              echo "::error::Feed directory missing: feeds/$feed"
-              exit 1
-            fi
-          done
-
-      - name: Install required LuCI packages
+      - name: Install only required LuCI packages
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
 
-          # Explicitly install the LuCI meta package.
-          # Installing luci-base alone does not install the "luci" package.
-          ./scripts/feeds install -d y -p luci \
+          # Install LuCI core, Chinese translation, HTTPS support,
+          # compatibility libraries and the built-in package manager.
+          ./scripts/feeds install -p luci \
             luci \
             luci-base \
+            luci-light \
             luci-ssl \
             luci-compat \
             luci-mod-admin-full \
             luci-theme-bootstrap \
-            luci-i18n-base-zh-cn
+            luci-i18n-base-zh-cn \
+            luci-app-package-manager
 
-          echo "Checking LuCI package installation..."
-
-          find package/feeds/luci -maxdepth 3 \
-            \( -path '*/luci/Makefile' \
-            -o -path '*/luci-base/Makefile' \
-            -o -path '*/luci-ssl/Makefile' \
-            -o -path '*/luci-compat/Makefile' \) \
-            -print 2>/dev/null || true
-
-          if [ ! -f package/feeds/luci/luci/Makefile ]; then
-            echo "::error::LuCI meta package is missing"
-            find feeds/luci package/feeds/luci \
-              -path '*/luci/Makefile' -print 2>/dev/null || true
-            exit 1
-          fi
-
-      - name: Install OpenClash dependencies
+      - name: Create minimal HNR101 configuration
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
-
-          # These packages are commonly declared by OpenClash.
-          # Install them from the packages feed rather than assuming
-          # that a host-side Ubuntu package satisfies firmware dependencies.
-          ./scripts/feeds install -d y -p packages \
-            bash \
-            ruby \
-            ruby-yaml \
-            unzip
-
-          echo "Checking OpenClash dependency package definitions..."
-
-          for pkg in bash ruby ruby-yaml unzip; do
-            if [ ! -f "package/feeds/packages/$pkg/Makefile" ]; then
-              echo "::warning::Package is not linked at package/feeds/packages/$pkg"
-              find package feeds/packages \
-                -path "*/$pkg/Makefile" -print 2>/dev/null | head -20 || true
-            fi
-          done
-
-      - name: Install iStore packages
-        run: |
-          set -euo pipefail
-          cd "$BUILD_DIR"
-
-          ./scripts/feeds install -d y -p istore luci-app-store
-
-          if [ ! -f package/feeds/istore/luci-app-store/Makefile ]; then
-            echo "::error::iStore Makefile was not installed"
-            find feeds/istore package/feeds/istore \
-              -path '*/luci-app-store/Makefile' -print 2>/dev/null || true
-            exit 1
-          fi
-
-          echo "iStore Makefile:"
-          sed -n '1,180p' package/feeds/istore/luci-app-store/Makefile
-
-          echo "iStore related package links:"
-          find package/feeds/istore -maxdepth 3 -name Makefile -print \
-            | head -100
-
-      - name: Add OpenClash
-        run: |
-          set -euo pipefail
-          cd "$BUILD_DIR"
-
-          git clone --depth=1 \
-            https://github.com/vernesong/OpenClash.git \
-            /tmp/OpenClash
-
-          if [ ! -f /tmp/OpenClash/luci-app-openclash/Makefile ]; then
-            echo "::error::OpenClash Makefile not found"
-            find /tmp/OpenClash -maxdepth 4 -name Makefile -print \
-              | head -100 || true
-            exit 1
-          fi
-
-          mkdir -p package/custom
-          rm -rf package/custom/luci-app-openclash
-
-          cp -a /tmp/OpenClash/luci-app-openclash \
-            package/custom/luci-app-openclash
-
-          test -f package/custom/luci-app-openclash/Makefile
-
-          echo "OpenClash dependencies:"
-          grep -nE 'LUCI_DEPENDS|DEPENDS|ruby|bash|unzip' \
-            package/custom/luci-app-openclash/Makefile | head -100 || true
-
-      - name: Generate HNR101 configuration
-        run: |
-          set -euo pipefail
-          cd "$BUILD_DIR"
 
           cat > .config <<'EOF'
           CONFIG_TARGET_qualcommax=y
           CONFIG_TARGET_qualcommax_ipq807x=y
           CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y
 
-          CONFIG_DEVEL=y
-          CONFIG_CCACHE=y
+          # Package manager
+          CONFIG_PACKAGE_opkg=y
 
+          # LuCI web interface
           CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-light=y
           CONFIG_PACKAGE_luci-ssl=y
           CONFIG_PACKAGE_luci-compat=y
-          CONFIG_LUCI_LANG_zh_Hans=y
+          CONFIG_PACKAGE_luci-mod-admin-full=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+
+          # Chinese language
           CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
 
-          CONFIG_PACKAGE_opkg=y
-          CONFIG_PACKAGE_curl=y
-          CONFIG_PACKAGE_ca-bundle=y
-          CONFIG_PACKAGE_tar=y
-          CONFIG_PACKAGE_mount-utils=y
-          CONFIG_PACKAGE_libuci-lua=y
-
-          CONFIG_PACKAGE_luci-app-store=y
-          CONFIG_PACKAGE_luci-app-openclash=y
-
-          CONFIG_PACKAGE_bash=y
-          CONFIG_PACKAGE_ruby=y
-          CONFIG_PACKAGE_ruby-yaml=y
-          CONFIG_PACKAGE_unzip=y
-          CONFIG_PACKAGE_coreutils-nohup=y
-          CONFIG_PACKAGE_dnsmasq-full=y
-          CONFIG_PACKAGE_ip-full=y
-          CONFIG_PACKAGE_ipset=y
-          CONFIG_PACKAGE_iptables=y
-          CONFIG_PACKAGE_iptables-mod-tproxy=y
-          CONFIG_PACKAGE_kmod-tun=y
-
-          CONFIG_PACKAGE_kmod-usb-core=y
-          CONFIG_PACKAGE_kmod-usb2=y
-          CONFIG_PACKAGE_kmod-usb3=y
-          CONFIG_PACKAGE_kmod-usb-storage=y
-          CONFIG_PACKAGE_kmod-usb-storage-uas=y
-          CONFIG_PACKAGE_block-mount=y
-          CONFIG_PACKAGE_kmod-fs-ext4=y
-          CONFIG_PACKAGE_kmod-fs-vfat=y
-          CONFIG_PACKAGE_kmod-nls-cp437=y
-          CONFIG_PACKAGE_kmod-nls-iso8859-1=y
-          CONFIG_PACKAGE_e2fsprogs=y
-          CONFIG_PACKAGE_fdisk=y
-          CONFIG_PACKAGE_lsblk=y
+          # Online package installation through LuCI
+          CONFIG_PACKAGE_luci-app-package-manager=y
           EOF
 
-          echo "Initial configuration:"
-          grep -E \
-            '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(luci|luci-ssl|luci-compat|luci-app-store|luci-app-openclash|opkg|bash|ruby|ruby-yaml|unzip))=' \
-            .config || true
+          # Set Chinese as the default LuCI language on first boot.
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-luci-language <<'EOF'
+          #!/bin/sh
+          uci -q set luci.main.lang='zh_cn'
+          uci -q commit luci
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/99-luci-language
 
-      - name: Run defconfig and validate configuration
+      - name: Resolve configuration
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
 
-          set +e
-          make defconfig V=s 2>&1 | tee /tmp/hnr101-defconfig.log
-          DEFCONFIG_STATUS=${PIPESTATUS[0]}
-          set -e
+          make defconfig
 
-          if [ "$DEFCONFIG_STATUS" -ne 0 ]; then
-            echo "::error::make defconfig failed"
-            tail -200 /tmp/hnr101-defconfig.log || true
-            exit "$DEFCONFIG_STATUS"
-          fi
+          echo "=== Target ==="
+          grep -E '^CONFIG_TARGET_qualcommax(_ipq807x)?=|^CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=' .config || true
 
-          echo "=== Resolved configuration ==="
-          grep -E \
-            '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(luci|luci-ssl|luci-compat|luci-app-store|luci-app-openclash|opkg|bash|ruby|ruby-yaml|unzip))=' \
-            .config || true
+          echo "=== Required packages ==="
+          grep -E '^CONFIG_PACKAGE_(opkg|luci|luci-base|luci-light|luci-ssl|luci-compat|luci-mod-admin-full|luci-theme-bootstrap|luci-i18n-base-zh-cn|luci-app-package-manager)=' .config || true
 
-          echo "=== Package Kconfig availability ==="
-          for symbol in \
-            PACKAGE_luci \
-            PACKAGE_luci-app-store \
-            PACKAGE_luci-app-openclash \
-            PACKAGE_bash \
-            PACKAGE_ruby \
-            PACKAGE_ruby-yaml \
-            PACKAGE_unzip; do
-
-            if ! grep -qE \
-              "^[[:space:]]*config[[:space:]]+$symbol([[:space:]]|$)" \
-              tmp/.config-package.in; then
-              echo "::warning::No generated Kconfig symbol found for $symbol"
-            fi
-          done
-
-          echo "=== Defconfig warnings and errors ==="
-          grep -niE \
-            'recursive dependency detected|dependency on .* does not exist|error:' \
-            /tmp/hnr101-defconfig.log | tail -200 || true
-
-          REQUIRED_CONFIGS=(
-            "CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y"
-            "CONFIG_PACKAGE_opkg=y"
-            "CONFIG_PACKAGE_luci=y"
-            "CONFIG_PACKAGE_luci-ssl=y"
-            "CONFIG_PACKAGE_luci-compat=y"
-            "CONFIG_LUCI_LANG_zh_Hans=y"
-            "CONFIG_PACKAGE_luci-app-openclash=y"
-            "CONFIG_PACKAGE_luci-app-store=y"
+          echo "=== Validate required configuration ==="
+          required_symbols=(
+            CONFIG_TARGET_qualcommax=y
+            CONFIG_TARGET_qualcommax_ipq807x=y
+            CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y
+            CONFIG_PACKAGE_opkg=y
+            CONFIG_PACKAGE_luci=y
+            CONFIG_PACKAGE_luci-ssl=y
+            CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+            CONFIG_PACKAGE_luci-app-package-manager=y
           )
 
-          for entry in "${REQUIRED_CONFIGS[@]}"; do
-            if ! grep -qxF "$entry" .config; then
-              echo "::error::Required configuration is missing: $entry"
-
-              echo "=== LuCI feed package definitions ==="
-              find feeds/luci package/feeds/luci \
-                -maxdepth 5 -name Makefile -print 2>/dev/null \
-                | grep -E '/(luci|luci-base|luci-ssl|luci-compat)/Makefile$' \
-                | head -100 || true
-
-              echo "=== iStore package definition ==="
-              sed -n '1,200p' \
-                package/feeds/istore/luci-app-store/Makefile || true
-
-              echo "=== Relevant package dependencies ==="
-              grep -nE \
-                'feeds/istore/luci-app-store|custom/luci-app-openclash|feeds/luci/luci' \
-                tmp/.packagedeps 2>/dev/null | head -150 || true
-
-              echo "=== Kconfig errors ==="
-              grep -ni -B3 -A8 \
-                'recursive dependency detected' \
-                /tmp/hnr101-defconfig.log || true
-
+          for symbol in "${required_symbols[@]}"; do
+            if ! grep -Fxq "$symbol" .config; then
+              echo "::error::Required configuration missing: $symbol"
               exit 1
             fi
           done
 
-          echo "Required configuration checks passed."
+          echo "=== Verify excluded plugins ==="
+          if grep -Eq '^CONFIG_PACKAGE_(luci-app-openclash|luci-app-store)=(y|m)$' .config; then
+            echo "::error::An excluded plugin is enabled"
+            exit 1
+          fi
+
+          echo "Configuration validation passed."
 
       - name: Download source packages
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
-          make download -j4
+          make download -j"$(nproc)" V=s
 
       - name: Compile firmware
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
+          make -j"$(nproc)" V=s
 
-          echo "CPU count: $(nproc)"
-          free -h
-          df -h
-
-          make -j2 V=s
-
-      - name: Verify firmware output
+      - name: List firmware images
         if: success()
+        working-directory: immortalwrt
         run: |
           set -euo pipefail
-          cd "$BUILD_DIR"
+          echo "=== Firmware files ==="
+          find bin/targets/qualcommax/ipq807x \
+            -maxdepth 1 -type f \
+            \( -name '*.bin' -o -name '*.ubi' -o -name '*.img' -o -name '*.itb' -o -name '*.manifest' -o -name '*.buildinfo' \) \
+            -print
 
-          OUTPUT_DIR="bin/targets/qualcommax/ipq807x"
-
-          if [ ! -d "$OUTPUT_DIR" ]; then
-            echo "::error::Firmware output directory not found: $OUTPUT_DIR"
-            find bin/targets -maxdepth 4 -type f -print 2>/dev/null \
-              | head -200 || true
-            exit 1
-          fi
-
-          echo "Generated firmware files:"
-          find "$OUTPUT_DIR" -maxdepth 2 -type f \
-            -printf '%p (%s bytes)\n'
-
-          if ! find "$OUTPUT_DIR" -maxdepth 2 -type f \
-            \( -iname '*hnr101*' -o -iname '*hisense*' \) | grep -q .; then
-            echo "::error::No HNR101/Hisense-named firmware file found"
-            find "$OUTPUT_DIR" -maxdepth 2 -type f \
-              \( -iname '*.bin' -o -iname '*.img' -o -iname '*.itb' \
-                 -o -iname '*.ubi' -o -iname '*.tar' \) -print
-            exit 1
-          fi
-
-      - name: Upload firmware
+      - name: Upload firmware artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: immortalwrt-hnr101-${{ github.run_number }}
-          path: immortalwrt/bin/targets/qualcommax/ipq807x/
+          name: ImmortalWrt-HNR101-Minimal-Chinese
+          path: |
+            immortalwrt/bin/targets/qualcommax/ipq807x/*.bin
+            immortalwrt/bin/targets/qualcommax/ipq807x/*.ubi
+            immortalwrt/bin/targets/qualcommax/ipq807x/*.img
+            immortalwrt/bin/targets/qualcommax/ipq807x/*.itb
+            immortalwrt/bin/targets/qualcommax/ipq807x/*.manifest
+            immortalwrt/bin/targets/qualcommax/ipq807x/*.buildinfo
           if-no-files-found: error
           compression-level: 1
-          retention-days: 14
-
-      - name: Upload diagnostic logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: hnr101-build-diagnostics-${{ github.run_number }}
-          path: |
-            /tmp/hnr101-defconfig.log
-            immortalwrt/.config
-            immortalwrt/tmp/.config-package.in
-            immortalwrt/tmp/.packagedeps
-          if-no-files-found: warn
-          compression-level: 6
-          retention-days: 7
