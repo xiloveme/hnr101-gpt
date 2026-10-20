@@ -1,4 +1,4 @@
-name: Build ImmortalWrt for Hisense HNR101
+name: Build ImmortalWrt HNR101 Minimal Chinese
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build HNR101 Minimal Chinese Firmware
+    name: Build HNR101
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
@@ -31,6 +31,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install build dependencies
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -60,63 +61,78 @@ jobs:
             ca-certificates \
             perl \
             cpio \
-            ecj \
-            fastjar \
-            java-propose-classpath \
             libelf-dev \
             device-tree-compiler \
             qemu-utils \
             time
 
       - name: Clone pinned ImmortalWrt source
+        shell: bash
         run: |
           set -euo pipefail
           git clone "$REPO_URL" "$BUILD_DIR"
           cd "$BUILD_DIR"
           git checkout --detach "$REPO_COMMIT"
-          echo "Source commit:"
+          echo "=== Source commit ==="
           git rev-parse HEAD
 
-      - name: Remove optional third-party feed entries
+      - name: Remove optional plugin feeds
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Do not add iStore or OpenClash feeds.
-          # Remove matching optional entries if they exist in this checkout.
+          # Do not add third-party feeds for OpenClash or iStore.
+          if [ -f feeds.conf ]; then
+            sed -i '/istore/d;/openclash/d' feeds.conf
+          fi
+
           if [ -f feeds.conf.default ]; then
             sed -i '/istore/d;/openclash/d' feeds.conf.default
           fi
 
-          echo "Configured feeds:"
+          echo "=== Feed configuration ==="
           cat feeds.conf.default
 
       - name: Update feeds
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
           ./scripts/feeds update -a
 
-      - name: Install only required LuCI packages
+      - name: Install LuCI core and package manager
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Install LuCI core, Chinese translation, HTTPS support,
-          # compatibility libraries and the built-in package manager.
           ./scripts/feeds install -p luci \
             luci \
             luci-base \
             luci-light \
             luci-ssl \
             luci-compat \
-            luci-mod-admin-full \
             luci-theme-bootstrap \
-            luci-i18n-base-zh-cn \
             luci-app-package-manager
+
+          echo "=== Verify LuCI package definitions ==="
+          grep -Rni \
+            --include='Makefile' \
+            --include='luci.mk' \
+            'LUCI_LANG.zh_Hans' \
+            feeds/luci package 2>/dev/null | head -30 || true
+
+          echo "=== Verify Chinese translation symbol exists ==="
+          grep -Rni \
+            --include='*.mk' \
+            --include='Makefile' \
+            'LUCI_LANG_zh_Hans' \
+            feeds/luci package 2>/dev/null | head -30 || true
 
       - name: Create minimal HNR101 configuration
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -125,96 +141,110 @@ jobs:
           CONFIG_TARGET_qualcommax_ipq807x=y
           CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y
 
-          # Package manager
+          # Select Simplified Chinese in LuCI.
+          CONFIG_LUCI_LANG_zh_Hans=y
+
+          # Package manager.
           CONFIG_PACKAGE_opkg=y
 
-          # LuCI web interface
+          # LuCI web interface.
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-base=y
           CONFIG_PACKAGE_luci-light=y
           CONFIG_PACKAGE_luci-ssl=y
           CONFIG_PACKAGE_luci-compat=y
-          CONFIG_PACKAGE_luci-mod-admin-full=y
           CONFIG_PACKAGE_luci-theme-bootstrap=y
 
-          # Chinese language
-          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-
-          # Online package installation through LuCI
+          # LuCI online package installation page.
           CONFIG_PACKAGE_luci-app-package-manager=y
+
+          # Base Chinese translation package.
+          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
           EOF
 
-          # Set Chinese as the default LuCI language on first boot.
           mkdir -p files/etc/uci-defaults
+
           cat > files/etc/uci-defaults/99-luci-language <<'EOF'
           #!/bin/sh
           uci -q set luci.main.lang='zh_cn'
           uci -q commit luci
           exit 0
           EOF
+
           chmod +x files/etc/uci-defaults/99-luci-language
 
-      - name: Resolve configuration
+      - name: Resolve and validate configuration
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
 
           make defconfig
 
-          echo "=== Target ==="
+          echo "=== Target configuration ==="
           grep -E '^CONFIG_TARGET_qualcommax(_ipq807x)?=|^CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=' .config || true
 
-          echo "=== Required packages ==="
-          grep -E '^CONFIG_PACKAGE_(opkg|luci|luci-base|luci-light|luci-ssl|luci-compat|luci-mod-admin-full|luci-theme-bootstrap|luci-i18n-base-zh-cn|luci-app-package-manager)=' .config || true
+          echo "=== Chinese language configuration ==="
+          grep -E '^CONFIG_LUCI_LANG_zh_Hans=|^CONFIG_PACKAGE_luci-i18n-base-zh-cn=' .config || true
 
-          echo "=== Validate required configuration ==="
+          echo "=== Required package configuration ==="
+          grep -E '^CONFIG_PACKAGE_(opkg|luci|luci-base|luci-light|luci-ssl|luci-compat|luci-theme-bootstrap|luci-app-package-manager)=' .config || true
+
           required_symbols=(
-            CONFIG_TARGET_qualcommax=y
-            CONFIG_TARGET_qualcommax_ipq807x=y
-            CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y
-            CONFIG_PACKAGE_opkg=y
-            CONFIG_PACKAGE_luci=y
-            CONFIG_PACKAGE_luci-ssl=y
-            CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
-            CONFIG_PACKAGE_luci-app-package-manager=y
+            'CONFIG_TARGET_qualcommax=y'
+            'CONFIG_TARGET_qualcommax_ipq807x=y'
+            'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y'
+            'CONFIG_LUCI_LANG_zh_Hans=y'
+            'CONFIG_PACKAGE_opkg=y'
+            'CONFIG_PACKAGE_luci=y'
+            'CONFIG_PACKAGE_luci-ssl=y'
+            'CONFIG_PACKAGE_luci-i18n-base-zh-cn=y'
+            'CONFIG_PACKAGE_luci-app-package-manager=y'
           )
 
           for symbol in "${required_symbols[@]}"; do
             if ! grep -Fxq "$symbol" .config; then
               echo "::error::Required configuration missing: $symbol"
+              echo "Inspect the LuCI feed package definitions and Kconfig dependencies."
               exit 1
             fi
           done
 
-          echo "=== Verify excluded plugins ==="
           if grep -Eq '^CONFIG_PACKAGE_(luci-app-openclash|luci-app-store)=(y|m)$' .config; then
-            echo "::error::An excluded plugin is enabled"
+            echo "::error::OpenClash or iStore is enabled unexpectedly."
             exit 1
           fi
 
-          echo "Configuration validation passed."
+          echo "=== Configuration validation passed ==="
 
       - name: Download source packages
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
           make download -j"$(nproc)" V=s
 
       - name: Compile firmware
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
           make -j"$(nproc)" V=s
 
-      - name: List firmware images
+      - name: List firmware output
         if: success()
         working-directory: immortalwrt
+        shell: bash
         run: |
           set -euo pipefail
-          echo "=== Firmware files ==="
           find bin/targets/qualcommax/ipq807x \
             -maxdepth 1 -type f \
-            \( -name '*.bin' -o -name '*.ubi' -o -name '*.img' -o -name '*.itb' -o -name '*.manifest' -o -name '*.buildinfo' \) \
+            \( -name '*.bin' \
+            -o -name '*.ubi' \
+            -o -name '*.img' \
+            -o -name '*.itb' \
+            -o -name '*.manifest' \
+            -o -name '*.buildinfo' \) \
             -print
 
       - name: Upload firmware artifacts
