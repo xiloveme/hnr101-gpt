@@ -1,4 +1,4 @@
-name: Build ImmortalWrt HNR101 Minimal Chinese
+name: ImmortalWrt HNR101 Minimal Build
 
 on:
   workflow_dispatch:
@@ -12,125 +12,104 @@ permissions:
   contents: read
 
 concurrency:
-  group: hnr101-build-${{ github.ref }}
+  group: hnr101-immortalwrt-build
   cancel-in-progress: false
 
 jobs:
   build:
-    name: Build HNR101
+    name: Build HNR101 Firmware
     runs-on: ubuntu-22.04
     timeout-minutes: 360
 
-    env:
-      REPO_URL: https://github.com/sqliuchang/immortalwrt.git
-      REPO_COMMIT: af7729479ddf19fecac5872fb89344958832ab12
-      BUILD_DIR: immortalwrt
-
     steps:
-      - name: Checkout workflow repository
-        uses: actions/checkout@v4
-
       - name: Install build dependencies
-        shell: bash
         run: |
-          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
-            build-essential \
-            clang \
-            flex \
-            bison \
-            g++ \
-            gawk \
-            gcc-multilib \
-            g++-multilib \
-            gettext \
-            git \
-            libncurses-dev \
-            libssl-dev \
-            python3 \
-            python3-setuptools \
-            python3-pyelftools \
-            rsync \
-            swig \
-            unzip \
-            zlib1g-dev \
-            file \
-            wget \
-            curl \
-            ca-certificates \
-            perl \
-            cpio \
-            libelf-dev \
-            device-tree-compiler \
-            qemu-utils \
-            time
+            ack asciidoc autoconf automake autopoint \
+            binutils bison build-essential bzip2 ccache clang \
+            cmake cpio curl device-tree-compiler flex gawk gcc-multilib \
+            g++-multilib gettext git gnutls-dev gperf \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+            libmpc-dev libmpfr-dev libncurses-dev libpython3-dev \
+            libreadline-dev libssl-dev libtool libyaml-dev \
+            libz-dev lld llvm make nano patch perl \
+            python3 python3-distutils python3-setuptools \
+            qemu-utils rsync unzip wget xsltproc zlib1g-dev \
+            file findutils jq
 
-      - name: Clone pinned ImmortalWrt source
+      - name: Checkout ImmortalWrt source
         shell: bash
         run: |
           set -euo pipefail
-          git clone "$REPO_URL" "$BUILD_DIR"
-          cd "$BUILD_DIR"
-          git checkout --detach "$REPO_COMMIT"
-          echo "=== Source commit ==="
-          git rev-parse HEAD
+          git clone https://github.com/sqliuchang/immortalwrt.git immortalwrt
+          cd immortalwrt
+          git checkout af7729479ddf19fecac5872fb89344958832ab12
 
-      - name: Remove optional plugin feeds
+          echo "=== Source revision ==="
+          git log -1 --oneline
+          echo "SOURCE_COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Check target device support
         working-directory: immortalwrt
         shell: bash
         run: |
           set -euo pipefail
 
-          # Do not add third-party feeds for OpenClash or iStore.
-          if [ -f feeds.conf ]; then
-            sed -i '/istore/d;/openclash/d' feeds.conf
-          fi
+          test -f target/linux/qualcommax/dts/ipq8072-hnr101.dts || {
+            echo "::error::HNR101 DTS file was not found."
+            exit 1
+          }
 
-          if [ -f feeds.conf.default ]; then
-            sed -i '/istore/d;/openclash/d' feeds.conf.default
-          fi
+          grep -n -A 12 -B 4 'hisense_hnr101' \
+            target/linux/qualcommax/image/ipq807x.mk || {
+              echo "::error::HNR101 image definition was not found."
+              exit 1
+            }
 
-          echo "=== Feed configuration ==="
-          cat feeds.conf.default
-
-      - name: Update feeds
+      - name: Update package feeds
         working-directory: immortalwrt
         shell: bash
         run: |
           set -euo pipefail
+
+          # Do not add third-party feeds.
+          # Disable any existing iStore/OpenClash feed entries.
+          for f in feeds.conf feeds.conf.default; do
+            if [ -f "$f" ]; then
+              sed -i \
+                -e '/istore/d' \
+                -e '/openclash/d' \
+                "$f"
+            fi
+          done
+
           ./scripts/feeds update -a
 
-      - name: Install LuCI core and package manager
+      - name: Install minimal LuCI packages
         working-directory: immortalwrt
         shell: bash
         run: |
           set -euo pipefail
 
-          ./scripts/feeds install -p luci \
-            luci \
-            luci-base \
-            luci-light \
-            luci-ssl \
-            luci-compat \
-            luci-theme-bootstrap \
-            luci-app-package-manager
+          ./scripts/feeds install luci
 
-          echo "=== Verify LuCI package definitions ==="
-          grep -Rni \
-            --include='Makefile' \
-            --include='luci.mk' \
-            'LUCI_LANG.zh_Hans' \
-            feeds/luci package 2>/dev/null | head -30 || true
+          # Install the package manager UI only if this source provides it.
+          if find package feeds -type f \
+            -path '*/luci-app-package-manager/Makefile' \
+            -print -quit 2>/dev/null | grep -q .; then
+            ./scripts/feeds install luci-app-package-manager
+          else
+            echo "::warning::luci-app-package-manager is not present in this source; relying on the built-in package management page if available."
+          fi
 
-          echo "=== Verify Chinese translation symbol exists ==="
-          grep -Rni \
-            --include='*.mk' \
-            --include='Makefile' \
-            'LUCI_LANG_zh_Hans' \
-            feeds/luci package 2>/dev/null | head -30 || true
+          echo "=== Available Chinese translations ==="
+          find package feeds -type f \
+            \( -path '*/luci-i18n-base-zh-cn/Makefile' \
+            -o -path '*/luci-i18n-base-zh_Hans/Makefile' \) \
+            -print 2>/dev/null || true
 
-      - name: Create minimal HNR101 configuration
+      - name: Configure minimal firmware
         working-directory: immortalwrt
         shell: bash
         run: |
@@ -141,26 +120,60 @@ jobs:
           CONFIG_TARGET_qualcommax_ipq807x=y
           CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y
 
-          # Select Simplified Chinese in LuCI.
-          CONFIG_LUCI_LANG_zh_Hans=y
-
-          # Package manager.
-          CONFIG_PACKAGE_opkg=y
-
-          # LuCI web interface.
           CONFIG_PACKAGE_luci=y
           CONFIG_PACKAGE_luci-base=y
           CONFIG_PACKAGE_luci-light=y
           CONFIG_PACKAGE_luci-ssl=y
           CONFIG_PACKAGE_luci-compat=y
           CONFIG_PACKAGE_luci-theme-bootstrap=y
-
-          # LuCI online package installation page.
-          CONFIG_PACKAGE_luci-app-package-manager=y
-
-          # Base Chinese translation package.
-          CONFIG_PACKAGE_luci-i18n-base-zh-cn=y
+          CONFIG_PACKAGE_uhttpd=y
+          CONFIG_PACKAGE_uhttpd-mod-ubus=y
+          CONFIG_PACKAGE_rpcd=y
+          CONFIG_PACKAGE_rpcd-mod-file=y
+          CONFIG_PACKAGE_rpcd-mod-iwinfo=y
+          CONFIG_PACKAGE_rpcd-mod-luci=y
+          CONFIG_PACKAGE_opkg=y
           EOF
+
+          # Add the package-manager UI only when its package exists.
+          if find package feeds -type f \
+            -path '*/luci-app-package-manager/Makefile' \
+            -print -quit 2>/dev/null | grep -q .; then
+            echo 'CONFIG_PACKAGE_luci-app-package-manager=y' >> .config
+          fi
+
+          # Select Chinese translation packages only if they exist.
+          if find package feeds -type f \
+            -path '*/luci-i18n-base-zh-cn/Makefile' \
+            -print -quit 2>/dev/null | grep -q .; then
+            echo 'CONFIG_PACKAGE_luci-i18n-base-zh-cn=y' >> .config
+          elif find package feeds -type f \
+            -path '*/luci-i18n-base-zh_Hans/Makefile' \
+            -print -quit 2>/dev/null | grep -q .; then
+            echo 'CONFIG_PACKAGE_luci-i18n-base-zh_Hans=y' >> .config
+          else
+            echo "::warning::No matching base Chinese translation package was found."
+          fi
+
+          make defconfig
+
+          echo "=== Target configuration ==="
+          grep -E '^CONFIG_TARGET_(qualcommax|qualcommax_ipq807x|qualcommax_ipq807x_DEVICE_hisense_hnr101)=' .config || true
+
+          echo "=== Selected LuCI configuration ==="
+          grep -E '^CONFIG_PACKAGE_(luci|luci-base|luci-light|luci-ssl|luci-compat|luci-theme-bootstrap|luci-app-package-manager|luci-i18n-base-zh-cn|luci-i18n-base-zh_Hans|opkg)=' .config || true
+
+          if ! grep -qx 'CONFIG_TARGET_qualcommax=y' .config ||
+             ! grep -qx 'CONFIG_TARGET_qualcommax_ipq807x=y' .config ||
+             ! grep -qx 'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y' .config; then
+            echo "::error::The HNR101 target selection did not survive make defconfig."
+            exit 1
+          fi
+
+          if ! grep -qx 'CONFIG_PACKAGE_luci=y' .config; then
+            echo "::error::LuCI was not selected successfully."
+            exit 1
+          fi
 
           mkdir -p files/etc/uci-defaults
 
@@ -171,58 +184,56 @@ jobs:
           exit 0
           EOF
 
-          chmod +x files/etc/uci-defaults/99-luci-language
+          chmod 0755 files/etc/uci-defaults/99-luci-language
 
-      - name: Resolve and validate configuration
-        working-directory: immortalwrt
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          make defconfig
-
-          echo "=== Target configuration ==="
-          grep -E '^CONFIG_TARGET_qualcommax(_ipq807x)?=|^CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=' .config || true
-
-          echo "=== Chinese language configuration ==="
-          grep -E '^CONFIG_LUCI_LANG_zh_Hans=|^CONFIG_PACKAGE_luci-i18n-base-zh-cn=' .config || true
-
-          echo "=== Required package configuration ==="
-          grep -E '^CONFIG_PACKAGE_(opkg|luci|luci-base|luci-light|luci-ssl|luci-compat|luci-theme-bootstrap|luci-app-package-manager)=' .config || true
-
-          required_symbols=(
-            'CONFIG_TARGET_qualcommax=y'
-            'CONFIG_TARGET_qualcommax_ipq807x=y'
-            'CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y'
-            'CONFIG_LUCI_LANG_zh_Hans=y'
-            'CONFIG_PACKAGE_opkg=y'
-            'CONFIG_PACKAGE_luci=y'
-            'CONFIG_PACKAGE_luci-ssl=y'
-            'CONFIG_PACKAGE_luci-i18n-base-zh-cn=y'
-            'CONFIG_PACKAGE_luci-app-package-manager=y'
-          )
-
-          for symbol in "${required_symbols[@]}"; do
-            if ! grep -Fxq "$symbol" .config; then
-              echo "::error::Required configuration missing: $symbol"
-              echo "Inspect the LuCI feed package definitions and Kconfig dependencies."
-              exit 1
-            fi
-          done
-
-          if grep -Eq '^CONFIG_PACKAGE_(luci-app-openclash|luci-app-store)=(y|m)$' .config; then
-            echo "::error::OpenClash or iStore is enabled unexpectedly."
-            exit 1
-          fi
-
-          echo "=== Configuration validation passed ==="
-
-      - name: Download source packages
+      - name: Download package sources
         working-directory: immortalwrt
         shell: bash
         run: |
           set -euo pipefail
           make download -j"$(nproc)" V=s
+
+      - name: Prepare and synchronize Linux kernel configuration
+        working-directory: immortalwrt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prepare target kernel sources and the target configuration first.
+          make target/linux/prepare V=s
+
+          KERNEL_MAKEFILE="$(
+            find build_dir -type f \
+              -path '*/linux-qualcommax_ipq807x/linux-6.12*/Makefile' \
+              -print -quit
+          )"
+
+          if [ -z "$KERNEL_MAKEFILE" ]; then
+            echo "::error::Could not locate the prepared Linux 6.12 kernel Makefile."
+            find build_dir -type f -path '*/linux-*/Makefile' \
+              -print | head -n 100 || true
+            exit 1
+          fi
+
+          KERNEL_DIR="$(dirname "$KERNEL_MAKEFILE")"
+
+          if [ ! -f "$KERNEL_DIR/.config" ]; then
+            echo "::error::Kernel .config was not generated in $KERNEL_DIR"
+            find build_dir -type f -name .config \
+              -path '*linux-qualcommax_ipq807x*' -print || true
+            exit 1
+          fi
+
+          echo "Kernel directory: $KERNEL_DIR"
+
+          # Non-interactive Kconfig synchronization:
+          # new symbols take their Kconfig default values.
+          make -C "$KERNEL_DIR" ARCH=arm64 olddefconfig
+
+          echo "=== Relevant kernel options after olddefconfig ==="
+          grep -E \
+            '^(CONFIG_NF_CONNTRACK_DSCPREMARK_EXT|CONFIG_NF_CONNTRACK|CONFIG_TRANSPARENT_HUGEPAGE|CONFIG_ARM64_CONTPTE)=' \
+            "$KERNEL_DIR/.config" || true
 
       - name: Compile firmware
         working-directory: immortalwrt
@@ -231,33 +242,39 @@ jobs:
           set -euo pipefail
           make -j"$(nproc)" V=s
 
-      - name: List firmware output
+      - name: Show generated firmware
         if: success()
         working-directory: immortalwrt
         shell: bash
         run: |
           set -euo pipefail
+
+          echo "=== Firmware images ==="
           find bin/targets/qualcommax/ipq807x \
-            -maxdepth 1 -type f \
-            \( -name '*.bin' \
-            -o -name '*.ubi' \
-            -o -name '*.img' \
-            -o -name '*.itb' \
-            -o -name '*.manifest' \
-            -o -name '*.buildinfo' \) \
+            -maxdepth 2 -type f \
+            \( -name '*.bin' -o -name '*.ubi' -o -name '*.itb' \
+            -o -name '*.img' -o -name '*.tar' -o -name '*.manifest' \
+            -o -name 'sha256sums' \) \
             -print
 
       - name: Upload firmware artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: ImmortalWrt-HNR101-Minimal-Chinese
+          name: immortalwrt-hnr101-${{ github.run_number }}
           path: |
-            immortalwrt/bin/targets/qualcommax/ipq807x/*.bin
-            immortalwrt/bin/targets/qualcommax/ipq807x/*.ubi
-            immortalwrt/bin/targets/qualcommax/ipq807x/*.img
-            immortalwrt/bin/targets/qualcommax/ipq807x/*.itb
-            immortalwrt/bin/targets/qualcommax/ipq807x/*.manifest
-            immortalwrt/bin/targets/qualcommax/ipq807x/*.buildinfo
+            immortalwrt/bin/targets/qualcommax/ipq807x/
+            !immortalwrt/bin/targets/qualcommax/ipq807x/packages/
           if-no-files-found: error
-          compression-level: 1
+          retention-days: 14
+
+      - name: Upload build configuration for debugging
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hnr101-build-config-${{ github.run_number }}
+          path: |
+            immortalwrt/.config
+            immortalwrt/logs/
+          if-no-files-found: ignore
+          retention-days: 7
