@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: hnr101-hnr101-build-${{ github.ref }}
+  group: hnr101-build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -71,21 +71,25 @@ jobs:
             xsltproc \
             ca-certificates \
             ccache
+
           git --version
           python3 --version
 
-      - name: Clone ImmortalWrt at pinned commit
+      - name: Clone pinned ImmortalWrt source
         run: |
           set -euo pipefail
+
           git clone "$REPO_URL" "$BUILD_DIR"
           cd "$BUILD_DIR"
+
           git checkout --detach "$REPO_COMMIT"
 
           echo "Repository: $(git remote get-url origin)"
           echo "Commit: $(git rev-parse HEAD)"
+
           test "$(git rev-parse HEAD)" = "$REPO_COMMIT"
 
-      - name: Verify HNR101 target support
+      - name: Verify HNR101 target
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
@@ -107,11 +111,6 @@ jobs:
           grep -RniE 'hisense.hnr101|hnr101' \
             target/linux/qualcommax 2>/dev/null | head -100 || true
 
-          echo "Checking related calibration and board files..."
-          find package/firmware target/linux/qualcommax \
-            \( -iname '*hnr101*' -o -iname '*hisense*' \) \
-            -print 2>/dev/null | head -100 || true
-
       - name: Configure iStore feed
         run: |
           set -euo pipefail
@@ -126,31 +125,29 @@ jobs:
           grep -E '^[[:space:]]*src-git[[:space:]]+istore[[:space:]]' \
             feeds.conf.default
 
-      - name: Update package feeds
+      - name: Update feeds
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
 
           ./scripts/feeds update -a
 
-          test -d feeds/luci || {
-            echo "::error::LuCI feed was not downloaded"
-            exit 1
-          }
+          for feed in luci packages istore; do
+            if [ ! -d "feeds/$feed" ]; then
+              echo "::error::Feed directory missing: feeds/$feed"
+              exit 1
+            fi
+          done
 
-          test -d feeds/istore || {
-            echo "::error::iStore feed was not downloaded"
-            find feeds -maxdepth 2 -type d -print | head -100 || true
-            exit 1
-          }
-
-      - name: Install required LuCI and iStore packages
+      - name: Install required LuCI packages
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
 
-          # Install only required LuCI packages, not the entire LuCI feed.
+          # Explicitly install the LuCI meta package.
+          # Installing luci-base alone does not install the "luci" package.
           ./scripts/feeds install -d y -p luci \
+            luci \
             luci-base \
             luci-ssl \
             luci-compat \
@@ -158,28 +155,68 @@ jobs:
             luci-theme-bootstrap \
             luci-i18n-base-zh-cn
 
-          # Install iStore and its declared dependencies.
+          echo "Checking LuCI package installation..."
+
+          find package/feeds/luci -maxdepth 3 \
+            \( -path '*/luci/Makefile' \
+            -o -path '*/luci-base/Makefile' \
+            -o -path '*/luci-ssl/Makefile' \
+            -o -path '*/luci-compat/Makefile' \) \
+            -print 2>/dev/null || true
+
+          if [ ! -f package/feeds/luci/luci/Makefile ]; then
+            echo "::error::LuCI meta package is missing"
+            find feeds/luci package/feeds/luci \
+              -path '*/luci/Makefile' -print 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: Install OpenClash dependencies
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+
+          # These packages are commonly declared by OpenClash.
+          # Install them from the packages feed rather than assuming
+          # that a host-side Ubuntu package satisfies firmware dependencies.
+          ./scripts/feeds install -d y -p packages \
+            bash \
+            ruby \
+            ruby-yaml \
+            unzip
+
+          echo "Checking OpenClash dependency package definitions..."
+
+          for pkg in bash ruby ruby-yaml unzip; do
+            if [ ! -f "package/feeds/packages/$pkg/Makefile" ]; then
+              echo "::warning::Package is not linked at package/feeds/packages/$pkg"
+              find package feeds/packages \
+                -path "*/$pkg/Makefile" -print 2>/dev/null | head -20 || true
+            fi
+          done
+
+      - name: Install iStore packages
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+
           ./scripts/feeds install -d y -p istore luci-app-store
 
-          echo "Checking installed package Makefiles..."
-          find package/feeds -maxdepth 4 \
-            \( -path '*/luci-base/Makefile' \
-            -o -path '*/luci-ssl/Makefile' \
-            -o -path '*/luci-compat/Makefile' \
-            -o -path '*/luci-app-store/Makefile' \) \
-            -print
-
-          test -f package/feeds/istore/luci-app-store/Makefile || {
-            echo "::error::iStore package Makefile is missing"
+          if [ ! -f package/feeds/istore/luci-app-store/Makefile ]; then
+            echo "::error::iStore Makefile was not installed"
             find feeds/istore package/feeds/istore \
               -path '*/luci-app-store/Makefile' -print 2>/dev/null || true
             exit 1
-          }
+          fi
 
           echo "iStore Makefile:"
           sed -n '1,180p' package/feeds/istore/luci-app-store/Makefile
 
-      - name: Add OpenClash package
+          echo "iStore related package links:"
+          find package/feeds/istore -maxdepth 3 -name Makefile -print \
+            | head -100
+
+      - name: Add OpenClash
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
@@ -188,25 +225,26 @@ jobs:
             https://github.com/vernesong/OpenClash.git \
             /tmp/OpenClash
 
-          test -f /tmp/OpenClash/luci-app-openclash/Makefile || {
-            echo "::error::OpenClash package Makefile not found"
+          if [ ! -f /tmp/OpenClash/luci-app-openclash/Makefile ]; then
+            echo "::error::OpenClash Makefile not found"
             find /tmp/OpenClash -maxdepth 4 -name Makefile -print \
               | head -100 || true
             exit 1
-          }
+          fi
 
           mkdir -p package/custom
           rm -rf package/custom/luci-app-openclash
+
           cp -a /tmp/OpenClash/luci-app-openclash \
             package/custom/luci-app-openclash
 
           test -f package/custom/luci-app-openclash/Makefile
 
-          echo "OpenClash package installed."
-          grep -nE 'LUCI_TITLE|LUCI_DEPENDS|define Package' \
-            package/custom/luci-app-openclash/Makefile | head -40 || true
+          echo "OpenClash dependencies:"
+          grep -nE 'LUCI_DEPENDS|DEPENDS|ruby|bash|unzip' \
+            package/custom/luci-app-openclash/Makefile | head -100 || true
 
-      - name: Prepare HNR101 configuration
+      - name: Generate HNR101 configuration
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
@@ -236,6 +274,9 @@ jobs:
           CONFIG_PACKAGE_luci-app-openclash=y
 
           CONFIG_PACKAGE_bash=y
+          CONFIG_PACKAGE_ruby=y
+          CONFIG_PACKAGE_ruby-yaml=y
+          CONFIG_PACKAGE_unzip=y
           CONFIG_PACKAGE_coreutils-nohup=y
           CONFIG_PACKAGE_dnsmasq-full=y
           CONFIG_PACKAGE_ip-full=y
@@ -243,7 +284,6 @@ jobs:
           CONFIG_PACKAGE_iptables=y
           CONFIG_PACKAGE_iptables-mod-tproxy=y
           CONFIG_PACKAGE_kmod-tun=y
-          CONFIG_PACKAGE_ruby=y
 
           CONFIG_PACKAGE_kmod-usb-core=y
           CONFIG_PACKAGE_kmod-usb2=y
@@ -260,12 +300,12 @@ jobs:
           CONFIG_PACKAGE_lsblk=y
           EOF
 
-          echo "Initial package configuration:"
+          echo "Initial configuration:"
           grep -E \
-            '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(opkg|luci|luci-ssl|luci-compat|luci-i18n-base-zh-cn|luci-app-store|luci-app-openclash))=' \
+            '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(luci|luci-ssl|luci-compat|luci-app-store|luci-app-openclash|opkg|bash|ruby|ruby-yaml|unzip))=' \
             .config || true
 
-      - name: Resolve and diagnose Kconfig
+      - name: Run defconfig and validate configuration
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
@@ -281,42 +321,33 @@ jobs:
             exit "$DEFCONFIG_STATUS"
           fi
 
-          echo "=== Final configuration ==="
+          echo "=== Resolved configuration ==="
           grep -E \
-            '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(opkg|luci|luci-ssl|luci-compat|luci-i18n-base-zh-cn|luci-app-store|luci-app-openclash))=' \
+            '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(luci|luci-ssl|luci-compat|luci-app-store|luci-app-openclash|opkg|bash|ruby|ruby-yaml|unzip))=' \
             .config || true
 
-          echo "=== Recursive dependency errors ==="
-          grep -n -B3 -A8 'recursive dependency detected' \
-            /tmp/hnr101-defconfig.log || true
+          echo "=== Package Kconfig availability ==="
+          for symbol in \
+            PACKAGE_luci \
+            PACKAGE_luci-app-store \
+            PACKAGE_luci-app-openclash \
+            PACKAGE_bash \
+            PACKAGE_ruby \
+            PACKAGE_ruby-yaml \
+            PACKAGE_unzip; do
 
-          # Confirm the generated Kconfig includes the iStore symbol.
-          if [ ! -f tmp/.config-package.in ]; then
-            echo "::error::Generated package Kconfig not found"
-            exit 1
-          fi
+            if ! grep -qE \
+              "^[[:space:]]*config[[:space:]]+$symbol([[:space:]]|$)" \
+              tmp/.config-package.in; then
+              echo "::warning::No generated Kconfig symbol found for $symbol"
+            fi
+          done
 
-          LINE=$(grep -nE \
-            '^[[:space:]]*config[[:space:]]+PACKAGE_luci-app-store([[:space:]]|$)' \
-            tmp/.config-package.in | head -1 | cut -d: -f1 || true)
+          echo "=== Defconfig warnings and errors ==="
+          grep -niE \
+            'recursive dependency detected|dependency on .* does not exist|error:' \
+            /tmp/hnr101-defconfig.log | tail -200 || true
 
-          if [ -z "$LINE" ]; then
-            echo "::error::iStore symbol missing from generated Kconfig"
-            grep -Rni 'luci-app-store' \
-              feeds/istore package/feeds/istore tmp 2>/dev/null \
-              | head -150 || true
-            exit 1
-          fi
-
-          echo "=== iStore Kconfig definition ==="
-          END=$((LINE + 45))
-          sed -n "${LINE},${END}p" tmp/.config-package.in
-
-          echo "=== iStore package dependencies ==="
-          grep -nE 'luci-app-store|luci-lib-taskd|curl|mount-utils' \
-            tmp/.packagedeps | head -100 || true
-
-          # Do not silently accept a missing required package.
           REQUIRED_CONFIGS=(
             "CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y"
             "CONFIG_PACKAGE_opkg=y"
@@ -332,31 +363,31 @@ jobs:
             if ! grep -qxF "$entry" .config; then
               echo "::error::Required configuration is missing: $entry"
 
-              if [ "$entry" = "CONFIG_PACKAGE_luci-app-store=y" ]; then
-                echo "=== iStore Makefile ==="
-                sed -n '1,200p' \
-                  package/feeds/istore/luci-app-store/Makefile || true
+              echo "=== LuCI feed package definitions ==="
+              find feeds/luci package/feeds/luci \
+                -maxdepth 5 -name Makefile -print 2>/dev/null \
+                | grep -E '/(luci|luci-base|luci-ssl|luci-compat)/Makefile$' \
+                | head -100 || true
 
-                echo "=== iStore Kconfig context ==="
-                grep -n -B8 -A45 'config PACKAGE_luci-app-store' \
-                  tmp/.config-package.in || true
+              echo "=== iStore package definition ==="
+              sed -n '1,200p' \
+                package/feeds/istore/luci-app-store/Makefile || true
 
-                echo "=== iStore references ==="
-                grep -Rni 'luci-app-store' \
-                  feeds/istore package/feeds/istore tmp 2>/dev/null \
-                  | head -150 || true
-              fi
+              echo "=== Relevant package dependencies ==="
+              grep -nE \
+                'feeds/istore/luci-app-store|custom/luci-app-openclash|feeds/luci/luci' \
+                tmp/.packagedeps 2>/dev/null | head -150 || true
 
-              echo "=== Kconfig errors and warnings ==="
-              grep -niE \
-                'recursive dependency|luci-app-store|dependency detected|error:' \
-                /tmp/hnr101-defconfig.log | tail -200 || true
+              echo "=== Kconfig errors ==="
+              grep -ni -B3 -A8 \
+                'recursive dependency detected' \
+                /tmp/hnr101-defconfig.log || true
 
               exit 1
             fi
           done
 
-          echo "All required configuration options are enabled."
+          echo "Required configuration checks passed."
 
       - name: Download source packages
         run: |
@@ -369,14 +400,13 @@ jobs:
           set -euo pipefail
           cd "$BUILD_DIR"
 
-          echo "Starting HNR101 firmware build..."
           echo "CPU count: $(nproc)"
           free -h
           df -h
 
           make -j2 V=s
 
-      - name: Verify generated firmware
+      - name: Verify firmware output
         if: success()
         run: |
           set -euo pipefail
@@ -391,23 +421,20 @@ jobs:
             exit 1
           fi
 
-          echo "Generated files:"
+          echo "Generated firmware files:"
           find "$OUTPUT_DIR" -maxdepth 2 -type f \
             -printf '%p (%s bytes)\n'
 
           if ! find "$OUTPUT_DIR" -maxdepth 2 -type f \
             \( -iname '*hnr101*' -o -iname '*hisense*' \) | grep -q .; then
             echo "::error::No HNR101/Hisense-named firmware file found"
-            echo "Available image files:"
             find "$OUTPUT_DIR" -maxdepth 2 -type f \
               \( -iname '*.bin' -o -iname '*.img' -o -iname '*.itb' \
                  -o -iname '*.ubi' -o -iname '*.tar' \) -print
             exit 1
           fi
 
-          echo "Firmware output check passed."
-
-      - name: Upload firmware artifacts
+      - name: Upload firmware
         if: success()
         uses: actions/upload-artifact@v4
         with:
