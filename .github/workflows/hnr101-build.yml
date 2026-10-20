@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: hnr101-immortalwrt-build-${{ github.ref }}
+  group: hnr101-hnr101-build-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -34,8 +34,7 @@ jobs:
         run: |
           set -e
           df -h
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android
-          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           df -h
 
       - name: Install build dependencies
@@ -72,7 +71,6 @@ jobs:
             xsltproc \
             ca-certificates \
             ccache
-          sudo timedatectl set-timezone UTC
           git --version
           python3 --version
 
@@ -95,25 +93,24 @@ jobs:
           DTS="target/linux/qualcommax/dts/ipq8072-hnr101.dts"
           IMAGE_MK="target/linux/qualcommax/image/ipq807x.mk"
 
-          echo "Checking HNR101 device files..."
-          test -f "$DTS" || {
+          if [ ! -f "$DTS" ]; then
             echo "::error::HNR101 DTS not found: $DTS"
             find target/linux/qualcommax -iname '*hnr101*' -print || true
             exit 1
-          }
+          fi
 
-          test -f "$IMAGE_MK" || {
-            echo "::error::Qualcomm IPQ807x image definition not found"
+          if [ ! -f "$IMAGE_MK" ]; then
+            echo "::error::IPQ807x image definition not found"
             exit 1
-          }
+          fi
 
           grep -RniE 'hisense.hnr101|hnr101' \
             target/linux/qualcommax 2>/dev/null | head -100 || true
 
-          echo "Checking wireless calibration files..."
+          echo "Checking related calibration and board files..."
           find package/firmware target/linux/qualcommax \
-            -iname '*hnr101*' -o -iname '*hisense*' 2>/dev/null \
-            | head -100 || true
+            \( -iname '*hnr101*' -o -iname '*hisense*' \) \
+            -print 2>/dev/null | head -100 || true
 
       - name: Configure iStore feed
         run: |
@@ -126,7 +123,6 @@ jobs:
               >> feeds.conf.default
           fi
 
-          echo "Configured feeds:"
           grep -E '^[[:space:]]*src-git[[:space:]]+istore[[:space:]]' \
             feeds.conf.default
 
@@ -148,31 +144,40 @@ jobs:
             exit 1
           }
 
-      - name: Install LuCI and iStore packages
+      - name: Install required LuCI and iStore packages
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
 
-          ./scripts/feeds install -a -p luci
+          # Install only required LuCI packages, not the entire LuCI feed.
+          ./scripts/feeds install -d y -p luci \
+            luci-base \
+            luci-ssl \
+            luci-compat \
+            luci-mod-admin-full \
+            luci-theme-bootstrap \
+            luci-i18n-base-zh-cn
 
-          # Install iStore and its declared feed dependencies.
+          # Install iStore and its declared dependencies.
           ./scripts/feeds install -d y -p istore luci-app-store
 
-          echo "Checking the installed iStore package..."
-          if [ ! -f package/feeds/istore/luci-app-store/Makefile ]; then
-            echo "::error::iStore package Makefile was not installed"
-            echo "Searching for luci-app-store..."
-            find feeds package -path '*/luci-app-store/Makefile' \
-              -print 2>/dev/null || true
-            echo "Feed registration:"
-            grep -n 'istore' feeds.conf.default || true
-            echo "Installed feed directories:"
-            ls -la package/feeds/istore 2>/dev/null || true
-            exit 1
-          fi
+          echo "Checking installed package Makefiles..."
+          find package/feeds -maxdepth 4 \
+            \( -path '*/luci-base/Makefile' \
+            -o -path '*/luci-ssl/Makefile' \
+            -o -path '*/luci-compat/Makefile' \
+            -o -path '*/luci-app-store/Makefile' \) \
+            -print
 
-          grep -nE 'LUCI_TITLE|LUCI_DEPENDS|define Package/luci-app-store|luci.mk' \
-            package/feeds/istore/luci-app-store/Makefile || true
+          test -f package/feeds/istore/luci-app-store/Makefile || {
+            echo "::error::iStore package Makefile is missing"
+            find feeds/istore package/feeds/istore \
+              -path '*/luci-app-store/Makefile' -print 2>/dev/null || true
+            exit 1
+          }
+
+          echo "iStore Makefile:"
+          sed -n '1,180p' package/feeds/istore/luci-app-store/Makefile
 
       - name: Add OpenClash package
         run: |
@@ -184,7 +189,7 @@ jobs:
             /tmp/OpenClash
 
           test -f /tmp/OpenClash/luci-app-openclash/Makefile || {
-            echo "::error::OpenClash package Makefile was not found"
+            echo "::error::OpenClash package Makefile not found"
             find /tmp/OpenClash -maxdepth 4 -name Makefile -print \
               | head -100 || true
             exit 1
@@ -197,11 +202,11 @@ jobs:
 
           test -f package/custom/luci-app-openclash/Makefile
 
-          echo "OpenClash package installed:"
+          echo "OpenClash package installed."
           grep -nE 'LUCI_TITLE|LUCI_DEPENDS|define Package' \
             package/custom/luci-app-openclash/Makefile | head -40 || true
 
-      - name: Generate HNR101 build configuration
+      - name: Prepare HNR101 configuration
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
@@ -255,12 +260,16 @@ jobs:
           CONFIG_PACKAGE_lsblk=y
           EOF
 
-          echo "Initial HNR101 configuration:"
+          echo "Initial package configuration:"
           grep -E \
             '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(opkg|luci|luci-ssl|luci-compat|luci-i18n-base-zh-cn|luci-app-store|luci-app-openclash))=' \
             .config || true
 
-          # Run Kconfig resolution and retain a full diagnostic log.
+      - name: Resolve and diagnose Kconfig
+        run: |
+          set -euo pipefail
+          cd "$BUILD_DIR"
+
           set +e
           make defconfig V=s 2>&1 | tee /tmp/hnr101-defconfig.log
           DEFCONFIG_STATUS=${PIPESTATUS[0]}
@@ -272,69 +281,87 @@ jobs:
             exit "$DEFCONFIG_STATUS"
           fi
 
-          echo "Resolved target and package options:"
+          echo "=== Final configuration ==="
           grep -E \
             '^(CONFIG_TARGET_.*hnr101|CONFIG_PACKAGE_(opkg|luci|luci-ssl|luci-compat|luci-i18n-base-zh-cn|luci-app-store|luci-app-openclash))=' \
             .config || true
 
-          echo "Checking generated package Kconfig..."
+          echo "=== Recursive dependency errors ==="
+          grep -n -B3 -A8 'recursive dependency detected' \
+            /tmp/hnr101-defconfig.log || true
+
+          # Confirm the generated Kconfig includes the iStore symbol.
           if [ ! -f tmp/.config-package.in ]; then
-            echo "::error::tmp/.config-package.in was not generated"
-            find tmp -maxdepth 2 -iname '*config*package*' -print || true
+            echo "::error::Generated package Kconfig not found"
             exit 1
           fi
 
-          if ! grep -nE \
+          LINE=$(grep -nE \
             '^[[:space:]]*config[[:space:]]+PACKAGE_luci-app-store([[:space:]]|$)' \
-            tmp/.config-package.in; then
-            echo "::error::iStore is missing from generated package Kconfig"
-            echo "Package Makefile:"
-            sed -n '1,200p' \
-              package/feeds/istore/luci-app-store/Makefile || true
-            echo "References to the package:"
+            tmp/.config-package.in | head -1 | cut -d: -f1 || true)
+
+          if [ -z "$LINE" ]; then
+            echo "::error::iStore symbol missing from generated Kconfig"
             grep -Rni 'luci-app-store' \
               feeds/istore package/feeds/istore tmp 2>/dev/null \
               | head -150 || true
-            echo "Relevant defconfig log:"
-            grep -niE 'istore|luci-app-store|kconfig|warning|error' \
-              /tmp/hnr101-defconfig.log | tail -150 || true
             exit 1
           fi
 
-          # Do not silently accept defconfig dropping required packages.
+          echo "=== iStore Kconfig definition ==="
+          END=$((LINE + 45))
+          sed -n "${LINE},${END}p" tmp/.config-package.in
+
+          echo "=== iStore package dependencies ==="
+          grep -nE 'luci-app-store|luci-lib-taskd|curl|mount-utils' \
+            tmp/.packagedeps | head -100 || true
+
+          # Do not silently accept a missing required package.
           REQUIRED_CONFIGS=(
             "CONFIG_TARGET_qualcommax_ipq807x_DEVICE_hisense_hnr101=y"
             "CONFIG_PACKAGE_opkg=y"
             "CONFIG_PACKAGE_luci=y"
             "CONFIG_PACKAGE_luci-ssl=y"
-            "CONFIG_LUCI_LANG_zh_Hans=y"
             "CONFIG_PACKAGE_luci-compat=y"
+            "CONFIG_LUCI_LANG_zh_Hans=y"
             "CONFIG_PACKAGE_luci-app-openclash=y"
             "CONFIG_PACKAGE_luci-app-store=y"
           )
 
           for entry in "${REQUIRED_CONFIGS[@]}"; do
             if ! grep -qxF "$entry" .config; then
-              symbol="${entry%%=*}"
               echo "::error::Required configuration is missing: $entry"
-              echo "Kconfig references for $symbol:"
-              grep -Rni "$symbol" \
-                feeds/istore package/feeds/istore tmp 2>/dev/null \
-                | head -100 || true
-              echo "Relevant defconfig log:"
-              grep -niE 'istore|luci-app-store|dependency|warning|error' \
-                /tmp/hnr101-defconfig.log | tail -150 || true
+
+              if [ "$entry" = "CONFIG_PACKAGE_luci-app-store=y" ]; then
+                echo "=== iStore Makefile ==="
+                sed -n '1,200p' \
+                  package/feeds/istore/luci-app-store/Makefile || true
+
+                echo "=== iStore Kconfig context ==="
+                grep -n -B8 -A45 'config PACKAGE_luci-app-store' \
+                  tmp/.config-package.in || true
+
+                echo "=== iStore references ==="
+                grep -Rni 'luci-app-store' \
+                  feeds/istore package/feeds/istore tmp 2>/dev/null \
+                  | head -150 || true
+              fi
+
+              echo "=== Kconfig errors and warnings ==="
+              grep -niE \
+                'recursive dependency|luci-app-store|dependency detected|error:' \
+                /tmp/hnr101-defconfig.log | tail -200 || true
+
               exit 1
             fi
           done
 
-          echo "Required configuration checks passed."
+          echo "All required configuration options are enabled."
 
       - name: Download source packages
         run: |
           set -euo pipefail
           cd "$BUILD_DIR"
-
           make download -j4
 
       - name: Compile firmware
@@ -347,7 +374,6 @@ jobs:
           free -h
           df -h
 
-          # Conservative parallelism reduces the risk of running out of RAM.
           make -j2 V=s
 
       - name: Verify generated firmware
@@ -359,19 +385,19 @@ jobs:
           OUTPUT_DIR="bin/targets/qualcommax/ipq807x"
 
           if [ ! -d "$OUTPUT_DIR" ]; then
-            echo "::error::Expected firmware output directory not found: $OUTPUT_DIR"
+            echo "::error::Firmware output directory not found: $OUTPUT_DIR"
             find bin/targets -maxdepth 4 -type f -print 2>/dev/null \
               | head -200 || true
             exit 1
           fi
 
           echo "Generated files:"
-          find "$OUTPUT_DIR" -maxdepth 2 -type f -printf '%p (%s bytes)\n'
+          find "$OUTPUT_DIR" -maxdepth 2 -type f \
+            -printf '%p (%s bytes)\n'
 
           if ! find "$OUTPUT_DIR" -maxdepth 2 -type f \
-            \( -iname '*hnr101*' -o -iname '*hisense*' \) \
-            | grep -q .; then
-            echo "::error::No firmware filename containing HNR101 or Hisense was found"
+            \( -iname '*hnr101*' -o -iname '*hisense*' \) | grep -q .; then
+            echo "::error::No HNR101/Hisense-named firmware file found"
             echo "Available image files:"
             find "$OUTPUT_DIR" -maxdepth 2 -type f \
               \( -iname '*.bin' -o -iname '*.img' -o -iname '*.itb' \
@@ -379,15 +405,14 @@ jobs:
             exit 1
           fi
 
-          echo "Firmware verification passed."
+          echo "Firmware output check passed."
 
       - name: Upload firmware artifacts
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: immortalwrt-hnr101-${{ github.run_number }}
-          path: |
-            immortalwrt/bin/targets/qualcommax/ipq807x/
+          path: immortalwrt/bin/targets/qualcommax/ipq807x/
           if-no-files-found: error
           compression-level: 1
           retention-days: 14
@@ -400,7 +425,8 @@ jobs:
           path: |
             /tmp/hnr101-defconfig.log
             immortalwrt/.config
-            immortalwrt/logs/
+            immortalwrt/tmp/.config-package.in
+            immortalwrt/tmp/.packagedeps
           if-no-files-found: warn
           compression-level: 6
           retention-days: 7
